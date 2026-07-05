@@ -11,21 +11,35 @@
 ## Как проходит перевод
 
 Клиент видит один синхронный вызов; всё остальное – асинхронная сага
-с оркестрацией:
+с оркестрацией. Все межсервисные стрелки – события в Kafka
+(ключ партиционирования – `from_account`):
 
-```
-Клиент ──POST /transfers──▶ gateway ──payment.initiated──▶ orchestrator
-                                                              │
-                  antifraud.check.requested ◀────────────────┤
-   antifraud ──antifraud.check.completed──▶ orchestrator      │
-                  ledger.transfer.requested ◀─────────────────┤
-   ledger  ──ledger.transfer.completed/failed──▶ orchestrator │
-                  ▼                                            ▼
-        payment.completed / payment.failed        notification.requested ──▶ notification
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Клиент
+    participant G as gateway
+    participant O as orchestrator
+    participant A as antifraud
+    participant L as ledger
+    participant N as notification
+
+    C->>G: POST /transfers (Idempotency-Key)
+    G-)O: payment.initiated
+    G-->>C: 202 {payment_id, status=accepted}
+    O-)A: antifraud.check.requested
+    A-)O: antifraud.check.completed
+    O-)L: ledger.transfer.requested
+    Note over L: debit + credit + outbox<br/>в одной транзакции БД
+    L-)O: ledger.transfer.completed / failed
+    O-)N: notification.requested
+    N-->>C: уведомление об исходе
+    Note over O: payment.completed / payment.failed –<br/>терминальные события для внешних подписчиков
 ```
 
 Итог (`COMPLETED`/`FAILED` + причина) доступен через `GET /transfers/{payment_id}`,
-балансы – через `GET /accounts`.
+балансы – через `GET /accounts`. Подробные сценарии, включая отказы и дубликат, –
+в [docs/sequence/](docs/sequence/).
 
 ## Сервисы
 
