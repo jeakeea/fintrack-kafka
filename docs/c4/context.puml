@@ -1,0 +1,19 @@
+@startuml FinTrack_v2_C4_Context
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+title FinTrack v2 – C4 Level 1 (System Context): P2P-переводы
+
+Person(client, "Клиент", "Инициирует перевод денег между счетами через приложение/API")
+
+System(fintrack, "FinTrack v2", "Event-driven система P2P-переводов на Kafka.\nСага-оркестрация, двойная запись, идемпотентность, outbox")
+
+System_Ext(analytics, "Аналитика / Аудит", "Подписчики терминальных событий payment.completed / payment.failed")
+System_Ext(channels, "Каналы доставки", "Push / SMS / Email – внешние провайдеры уведомлений")
+
+Rel(client, fintrack, "Создаёт перевод, смотрит статус и балансы", "HTTPS / REST, Idempotency-Key")
+Rel(fintrack, client, "Уведомляет об исходе перевода", "Push (через провайдера)")
+Rel(fintrack, analytics, "Публикует терминальные события саги", "Kafka")
+Rel(fintrack, channels, "Отправляет уведомления", "Push/SMS/Email")
+
+SHOW_LEGEND()
+@enduml

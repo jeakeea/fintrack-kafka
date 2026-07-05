@@ -1,0 +1,366 @@
+openapi: 3.0.3
+
+info:
+  title: FinTrack v2 – Gateway API
+  version: 1.1.0
+  description: >
+    REST-вход системы P2P-переводов FinTrack v2 (сервис `gateway`, FastAPI) –
+    единственная синхронная точка контакта клиента с системой. Gateway валидирует
+    запрос, разрешает идемпотентность по заголовку `Idempotency-Key`, создаёт
+    `payment_id`, публикует стартовое событие `payment.initiated` в Kafka и сразу
+    отвечает клиенту. Сам перевод выполняется асинхронно распределённой сагой
+    (антифрод → леджер → уведомление); его текущее состояние читается из таблицы
+    `saga_state` методом `GET /transfers/{payment_id}`.
+
+
+    ДЕНЬГИ. Все суммы в API – целые числа в минорных единицах валюты (копейки),
+    тип `integer` (int64): 1500.00 ₽ = `150000`. Дробные типы и `float` в денежных
+    полях не используются нигде – это исключает ошибки округления.
+
+
+    ОШИБКИ. Тело ошибки – стандартный формат FastAPI: объект с полем `detail`.
+  contact:
+    name: FinTrack v2 – системный анализ
+
+servers:
+  - url: http://localhost:8000
+    description: Локальный gateway (порт по умолчанию GATEWAY_PORT=8000)
+
+tags:
+  - name: transfers
+    description: Создание перевода и просмотр его статуса
+  - name: accounts
+    description: Счета и балансы
+
+paths:
+  /transfers:
+    post:
+      tags:
+        - transfers
+      operationId: createTransfer
+      summary: Создать P2P-перевод
+      description: >
+        Принимает заявку на перевод и запускает сагу. Ответ `202 Accepted` означает
+        «заявка принята в обработку»: итоговый статус появится асинхронно и
+        запрашивается отдельным методом. Повтор запроса с тем же `Idempotency-Key`
+        (ретрай клиента) возвращает тот же `payment_id` со `status=duplicate` –
+        новый перевод не создаётся, событие повторно не публикуется.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >
+            Уникальный ключ операции, генерируется клиентом (рекомендуется UUID v4).
+            Гарантирует ровно одно создание перевода при любых ретраях.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+          example: 9f1c2a3e-7b54-4c1d-9a2b-0f3e4d5c6a7b
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferRequest'
+            examples:
+              transfer1500rub:
+                summary: Перевод 1500.00 ₽ Иван → Мария
+                value:
+                  from_account: acc_ivan
+                  to_account: acc_maria
+                  amount: 150000
+                  currency: RUB
+      responses:
+        '202':
+          description: Заявка принята (или уже была принята ранее – см. `status`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferAccepted'
+              examples:
+                accepted:
+                  summary: Новый перевод, сага запущена
+                  value:
+                    payment_id: 3f8c1a9e-2b54-4c1d-9a2b-0f3e4d5c6a7b
+                    status: accepted
+                duplicate:
+                  summary: Повтор с тем же Idempotency-Key
+                  value:
+                    payment_id: 3f8c1a9e-2b54-4c1d-9a2b-0f3e4d5c6a7b
+                    status: duplicate
+        '400':
+          description: Не передан обязательный заголовок `Idempotency-Key`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missingKey:
+                  value:
+                    detail: Idempotency-Key header is required
+        '422':
+          description: >
+            Ошибка валидации тела запроса (нет обязательного поля, `amount <= 0`
+            или не целое). Формат – стандартный ответ валидации FastAPI.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+
+  /transfers/{payment_id}:
+    get:
+      tags:
+        - transfers
+      operationId: getTransfer
+      summary: Получить статус перевода
+      description: >
+        Возвращает текущее состояние саги перевода – строку таблицы `saga_state`:
+        статус (`status`), последний выполненный шаг (`step`), реквизиты и причину
+        отказа (`reason`, для `FAILED`).
+      parameters:
+        - name: payment_id
+          in: path
+          required: true
+          description: Идентификатор платежа, выданный при создании перевода.
+          schema:
+            type: string
+          example: 3f8c1a9e-2b54-4c1d-9a2b-0f3e4d5c6a7b
+      responses:
+        '200':
+          description: Текущее состояние перевода.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferStatus'
+              examples:
+                pending:
+                  summary: Сага в процессе (ждём леджер)
+                  value:
+                    payment_id: 3f8c1a9e-2b54-4c1d-9a2b-0f3e4d5c6a7b
+                    status: LEDGER_PENDING
+                    step: LEDGER_REQUESTED
+                    from_account: acc_ivan
+                    to_account: acc_maria
+                    amount: 150000
+                    reason: null
+                    updated_at: '2026-07-05T12:00:01.234567+00:00'
+                completed:
+                  summary: Перевод завершён
+                  value:
+                    payment_id: 3f8c1a9e-2b54-4c1d-9a2b-0f3e4d5c6a7b
+                    status: COMPLETED
+                    step: COMPLETED
+                    from_account: acc_ivan
+                    to_account: acc_maria
+                    amount: 150000
+                    reason: null
+                    updated_at: '2026-07-05T12:00:02.345678+00:00'
+                failed:
+                  summary: Перевод отклонён леджером
+                  value:
+                    payment_id: 5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d
+                    status: FAILED
+                    step: FAILED
+                    from_account: acc_oleg
+                    to_account: acc_ivan
+                    amount: 200000
+                    reason: insufficient_funds
+                    updated_at: '2026-07-05T12:00:03.456789+00:00'
+        '404':
+          description: Перевод с таким `payment_id` не найден.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                notFound:
+                  value:
+                    detail: payment not found
+
+  /accounts:
+    get:
+      tags:
+        - accounts
+      operationId: listAccounts
+      summary: Список счетов с балансами
+      description: >
+        Возвращает счета и их текущие балансы из вью `balances`. Баланс не хранится –
+        он вычисляется как сумма `credit` минус сумма `debit` по проводкам
+        `ledger_entries`, поэтому всегда согласован с историей операций.
+        Значение – в минорных единицах (копейки). Сортировка – по `account_id`.
+      responses:
+        '200':
+          description: Список счетов с балансами.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Account'
+              examples:
+                accounts:
+                  value:
+                    - account_id: acc_ivan
+                      owner_name: Иван Смирнов
+                      balance: 850000
+                    - account_id: acc_maria
+                      owner_name: Мария Петрова
+                      balance: 650000
+                    - account_id: acc_oleg
+                      owner_name: Олег Сидоров
+                      balance: 500000
+
+components:
+  schemas:
+    TransferRequest:
+      type: object
+      required:
+        - from_account
+        - to_account
+        - amount
+      properties:
+        from_account:
+          type: string
+          description: Счёт-источник (списание). Он же – ключ партиционирования событий саги.
+          example: acc_ivan
+        to_account:
+          type: string
+          description: Счёт-получатель (зачисление).
+          example: acc_maria
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Сумма перевода в минорных единицах (копейки), строго больше нуля.
+          example: 150000
+        currency:
+          type: string
+          default: RUB
+          description: Валюта перевода (ISO-4217).
+          example: RUB
+
+    TransferAccepted:
+      type: object
+      required:
+        - payment_id
+        - status
+      properties:
+        payment_id:
+          type: string
+          format: uuid
+          description: Идентификатор платежа (UUID v4). Для дубликата – прежний идентификатор.
+          example: 3f8c1a9e-2b54-4c1d-9a2b-0f3e4d5c6a7b
+        status:
+          type: string
+          description: >
+            `accepted` – создан новый перевод, сага запущена;
+            `duplicate` – ключ уже использован, возвращён существующий `payment_id`.
+          enum:
+            - accepted
+            - duplicate
+          example: accepted
+
+    TransferStatus:
+      type: object
+      required:
+        - payment_id
+        - status
+      properties:
+        payment_id:
+          type: string
+          format: uuid
+          example: 3f8c1a9e-2b54-4c1d-9a2b-0f3e4d5c6a7b
+        status:
+          type: string
+          description: Статус саги (`saga_state.status`).
+          enum:
+            - INITIATED
+            - ANTIFRAUD_PENDING
+            - LEDGER_PENDING
+            - COMPLETED
+            - FAILED
+          example: COMPLETED
+        step:
+          type: string
+          nullable: true
+          description: Последний зафиксированный шаг саги (`saga_state.step`).
+          enum:
+            - INITIATED
+            - ANTIFRAUD_REQUESTED
+            - LEDGER_REQUESTED
+            - COMPLETED
+            - FAILED
+          example: COMPLETED
+        from_account:
+          type: string
+          example: acc_ivan
+        to_account:
+          type: string
+          example: acc_maria
+        amount:
+          type: integer
+          format: int64
+          description: Сумма перевода в минорных единицах (копейки).
+          example: 150000
+        reason:
+          type: string
+          nullable: true
+          description: Причина отказа для `status=FAILED` (например, `insufficient_funds`), иначе null.
+          example: null
+        updated_at:
+          type: string
+          format: date-time
+          description: Момент последнего перехода саги.
+
+    Account:
+      type: object
+      required:
+        - account_id
+        - owner_name
+        - balance
+      properties:
+        account_id:
+          type: string
+          example: acc_ivan
+        owner_name:
+          type: string
+          example: Иван Смирнов
+        balance:
+          type: integer
+          format: int64
+          description: Текущий баланс в минорных единицах (копейки). Может быть 0.
+          example: 850000
+
+    Error:
+      type: object
+      required:
+        - detail
+      properties:
+        detail:
+          type: string
+          description: Человекочитаемое описание ошибки (формат FastAPI).
+          example: payment not found
+
+    ValidationError:
+      type: object
+      description: Стандартный ответ валидации FastAPI/Pydantic (HTTP 422).
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items:
+                  anyOf:
+                    - type: string
+                    - type: integer
+                description: Путь до невалидного поля.
+              msg:
+                type: string
+                description: Сообщение об ошибке.
+              type:
+                type: string
+                description: Код типа ошибки.

@@ -1,0 +1,69 @@
+@startuml rollback_insufficient_funds
+title FinTrack v2 – Откат: недостаточно средств в леджере
+
+actor Client as C
+participant "Gateway" as G
+queue "Kafka" as K
+participant "Orchestrator" as O
+participant "Antifraud" as A
+participant "Ledger" as L
+participant "Notification" as N
+database "Postgres" as DB
+
+autonumber
+
+C -> G : POST /transfers (Idempotency-Key, ...)
+activate G
+G -> DB : INSERT idempotency_keys
+G -> K : publish payment.initiated (TransferData)
+G --> C : 202 Accepted {payment_id, status=accepted}
+deactivate G
+
+K -> O : payment.initiated
+activate O
+O -> DB : saga_state = ANTIFRAUD_PENDING
+O -> K : publish antifraud.check.requested
+deactivate O
+
+K -> A : antifraud.check.requested
+activate A
+A -> K : publish antifraud.check.completed (approved=true)
+deactivate A
+
+K -> O : antifraud.check.completed (approved=true)
+activate O
+O -> DB : saga_state = LEDGER_PENDING
+O -> K : publish ledger.transfer.requested
+deactivate O
+
+K -> L : ledger.transfer.requested
+activate L
+L -> DB : проверка баланса источника (вью balances)
+note right of L
+  Баланс from_account < amount.
+  Проводки НЕ создаются – двойная запись
+  не выполняется, инвариант сохранён.
+end note
+L -> K : publish ledger.transfer.failed\nLedgerResult{success=false, reason="insufficient_funds"}
+deactivate L
+
+K -> O : ledger.transfer.failed (success=false)
+activate O
+O -> DB : saga_state = FAILED, reason=insufficient_funds
+O -> K : publish payment.failed (PaymentOutcome{reason})
+O -> K : publish notification.requested\nNotificationData{status=failed}
+deactivate O
+
+K -> N : notification.requested
+activate N
+N -> DB : INSERT notifications(status=failed)
+N -> C : уведомление: перевод отклонён (недостаточно средств)
+deactivate N
+
+note over O, L
+  Компенсация не нужна: до отказа леджера
+  никаких денежных проводок не было.
+  Откат = только перевод саги в FAILED.
+end note
+
+@enduml

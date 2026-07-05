@@ -1,0 +1,50 @@
+@startuml FinTrack_v2_C4_Container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title FinTrack v2 – C4 Level 2 (Containers): сервисы, Kafka, Postgres
+
+Person(client, "Клиент", "Инициирует перевод")
+
+System_Boundary(fintrack, "FinTrack v2") {
+    Container(gateway, "gateway", "Python, FastAPI", "REST-вход. Идемпотентность по Idempotency-Key. Публикует payment.initiated")
+    Container(orchestrator, "orchestrator", "Python, aiokafka", "SAGA-оркестратор. Хранит saga_state. Координирует антифрод → леджер → уведомление")
+    Container(ledger, "ledger", "Python, aiokafka", "Двойная запись (debit/credit). Outbox. Баланс через вью balances")
+    Container(antifraud, "antifraud", "Python, aiokafka", "Проверка правил (велосити, лимиты). Возвращает решение")
+    Container(notification, "notification", "Python, aiokafka", "Доставка уведомлений. Журнал в notifications")
+
+    ContainerQueue(kafka, "Apache Kafka", "KRaft, 9 топиков + DLQ", "Шина событий. Ключ партиционирования = from_account. At-least-once, DLQ")
+    ContainerDb(postgres, "PostgreSQL 16", "Реляционная БД", "accounts, ledger_entries, outbox, idempotency_keys, saga_state, notifications")
+}
+
+System_Ext(analytics, "Аналитика / Аудит", "Внешние подписчики терминальных событий")
+
+' --- Синхронный вход ---
+Rel(client, gateway, "POST /transfers, GET /transfers/{id}, GET /accounts", "HTTPS/REST")
+
+' --- gateway ---
+Rel(gateway, postgres, "Резолв идемпотентности (idempotency_keys), чтение balances", "SQL/asyncpg")
+Rel(gateway, kafka, "publish: payment.initiated", "Kafka, key=from_account")
+
+' --- orchestrator ---
+Rel(kafka, orchestrator, "consume: payment.initiated,\nantifraud.check.completed,\nledger.transfer.completed/failed", "Kafka")
+Rel(orchestrator, kafka, "publish: antifraud.check.requested,\nledger.transfer.requested,\nnotification.requested,\npayment.completed/failed", "Kafka")
+Rel(orchestrator, postgres, "Чтение/запись saga_state", "SQL/asyncpg")
+
+' --- antifraud ---
+Rel(kafka, antifraud, "consume: antifraud.check.requested", "Kafka")
+Rel(antifraud, kafka, "publish: antifraud.check.completed", "Kafka")
+
+' --- ledger ---
+Rel(kafka, ledger, "consume: ledger.transfer.requested", "Kafka")
+Rel(ledger, postgres, "Проводки + событие в ОДНОЙ транзакции (outbox)", "SQL/asyncpg")
+Rel(ledger, kafka, "publish (outbox relay): ledger.transfer.completed/failed", "Kafka")
+
+' --- notification ---
+Rel(kafka, notification, "consume: notification.requested", "Kafka")
+Rel(notification, postgres, "Запись журнала notifications", "SQL/asyncpg")
+
+' --- внешние подписчики ---
+Rel(kafka, analytics, "consume: payment.completed/failed", "Kafka")
+
+SHOW_LEGEND()
+@enduml

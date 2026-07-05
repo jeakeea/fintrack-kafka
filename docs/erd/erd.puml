@@ -1,0 +1,96 @@
+@startuml erd
+title FinTrack v2 – ER-диаграмма (db/001_init.sql)
+
+hide circle
+skinparam linetype ortho
+
+' Нотация: PK – первичный ключ, FK – внешний ключ, U – уникальное ограничение.
+
+entity "accounts" as accounts {
+  * id : TEXT <<PK>>
+  --
+  * owner_name : TEXT
+  * currency : TEXT = 'RUB'
+  * created_at : TIMESTAMPTZ = now()
+}
+
+entity "ledger_entries" as ledger {
+  * id : BIGSERIAL <<PK>>
+  --
+  * payment_id : TEXT
+  * account_id : TEXT <<FK accounts.id>>
+  * direction : TEXT <<CHECK debit|credit>>
+  * amount : BIGINT <<CHECK > 0>>
+  * created_at : TIMESTAMPTZ = now()
+  --
+  U (payment_id, account_id, direction)
+  idx_ledger_account (account_id)
+}
+
+entity "outbox" as outbox {
+  * id : BIGSERIAL <<PK>>
+  --
+  * topic : TEXT
+  msg_key : TEXT
+  * payload : JSONB
+  * created_at : TIMESTAMPTZ = now()
+  published_at : TIMESTAMPTZ
+  --
+  idx_outbox_unpublished (id) WHERE published_at IS NULL
+}
+
+entity "idempotency_keys" as idem {
+  * key : TEXT <<PK>>
+  --
+  * payment_id : TEXT
+  * created_at : TIMESTAMPTZ = now()
+}
+
+entity "saga_state" as saga {
+  * payment_id : TEXT <<PK>>
+  --
+  * status : TEXT
+  step : TEXT
+  from_account : TEXT
+  to_account : TEXT
+  amount : BIGINT
+  reason : TEXT
+  * updated_at : TIMESTAMPTZ = now()
+}
+
+entity "notifications" as notif {
+  * id : BIGSERIAL <<PK>>
+  --
+  * payment_id : TEXT
+  recipient : TEXT
+  channel : TEXT
+  status : TEXT
+  text : TEXT
+  * created_at : TIMESTAMPTZ = now()
+}
+
+note as N_balances
+  <b>VIEW balances</b> (вычисляемое представление):
+  balance = SUM(credit) − SUM(debit) по ledger_entries,
+  сгруппировано по account_id. LEFT JOIN accounts,
+  COALESCE(...,0) для счёта без проводок.
+end note
+
+' --- Связи (FK явный только один: ledger_entries.account_id -> accounts.id) ---
+accounts ||--o{ ledger : "account_id (FK)"
+N_balances .. accounts
+N_balances .. ledger
+
+' --- Логические связи через payment_id (НЕ FK в схеме, сквозной ключ саги) ---
+idem ||..o| saga : "payment_id (логич.)"
+saga ||..o{ ledger : "payment_id (логич.)"
+saga ||..o{ notif : "payment_id (логич.)"
+ledger ||..o{ outbox : "событие проводки (логич.)"
+
+legend right
+  Сплошная линия с ромбом – реальный FOREIGN KEY (account_id).
+  Пунктир – логическая связь по payment_id (сквозной ключ саги,
+  FK в схеме намеренно не задан: сервисы изолированы по данным).
+end legend
+
+@enduml

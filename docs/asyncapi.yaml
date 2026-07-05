@@ -1,0 +1,578 @@
+asyncapi: 3.0.0
+
+info:
+  title: FinTrack v2 – Event API (Kafka)
+  version: 1.0.0
+  description: >
+    Каталог событий P2P-переводов FinTrack v2. Система построена на саге
+    (оркестрация). Все события сериализуются в единый конверт `EventEnvelope`
+    (см. `shared/events.py`), полезная нагрузка лежит в поле `data`.
+
+
+    Контракт-источник: `shared/topics.py` (9 топиков) и `shared/events.py`
+    (конверт + payload-схемы). Деньги – целые минорные единицы (копейки),
+    тип `integer`, без `float`.
+
+
+    Гарантии доставки: at-least-once (commit оффсета только после успешной
+    обработки), идемпотентные обработчики. После `maxRetries=3` неудач
+    сообщение уходит в `<topic>.dlq`.
+  contact:
+    name: FinTrack v2 – команда системного анализа
+  tags:
+    - name: saga
+      description: События саги P2P-перевода
+    - name: money
+      description: Каналы, переносящие денежные суммы (минорные единицы)
+
+defaultContentType: application/json
+
+servers:
+  local:
+    host: localhost:29092
+    protocol: kafka
+    description: Локальный брокер Kafka (KRaft), listener PLAINTEXT_HOST.
+    bindings:
+      kafka:
+        bindingVersion: 0.5.0
+
+channels:
+  payment.initiated:
+    address: payment.initiated
+    description: >
+      Платёж создан в gateway после валидации запроса и резолва идемпотентности.
+      Старт саги. Ключ партиционирования – `from_account`.
+    messages:
+      PaymentInitiated:
+        $ref: '#/components/messages/PaymentInitiated'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  payment.completed:
+    address: payment.completed
+    description: >
+      Терминальное событие саги: перевод успешно завершён (антифрод одобрил,
+      леджер провёл двойную запись). Для внешних подписчиков (аналитика, аудит).
+    messages:
+      PaymentCompleted:
+        $ref: '#/components/messages/PaymentCompleted'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  payment.failed:
+    address: payment.failed
+    description: >
+      Терминальное событие саги: перевод отклонён (антифрод или леджер вернули
+      отказ). Несёт причину отказа. Для внешних подписчиков (аналитика, аудит).
+    messages:
+      PaymentFailed:
+        $ref: '#/components/messages/PaymentFailed'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  antifraud.check.requested:
+    address: antifraud.check.requested
+    description: Команда оркестратора антифроду – проверить перевод по правилам (велосити, лимиты).
+    messages:
+      AntifraudCheckRequested:
+        $ref: '#/components/messages/AntifraudCheckRequested'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  antifraud.check.completed:
+    address: antifraud.check.completed
+    description: Ответ антифрода оркестратору – решение (approved) и скоринг.
+    messages:
+      AntifraudCheckCompleted:
+        $ref: '#/components/messages/AntifraudCheckCompleted'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  ledger.transfer.requested:
+    address: ledger.transfer.requested
+    description: >
+      Команда оркестратора леджеру – провести двойную запись (debit источника +
+      credit получателя). Нагрузка – TransferData, причём `idempotency_key` =
+      `payment_id` (orchestrator подставляет payment_id, т.к. saga_state не хранит
+      исходный Idempotency-Key). На идемпотентность это не влияет: ledger
+      идемпотентен по UNIQUE(payment_id, account_id, direction).
+    messages:
+      LedgerTransferRequested:
+        $ref: '#/components/messages/LedgerTransferRequested'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  ledger.transfer.completed:
+    address: ledger.transfer.completed
+    description: Леджер успешно провёл проводки (через outbox). Ответ оркестратору.
+    messages:
+      LedgerTransferCompleted:
+        $ref: '#/components/messages/LedgerTransferCompleted'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  ledger.transfer.failed:
+    address: ledger.transfer.failed
+    description: >
+      Леджер отклонил проводку (например, недостаточно средств на счёте-источнике).
+      Ответ оркестратору – триггер отката саги.
+    messages:
+      LedgerTransferFailed:
+        $ref: '#/components/messages/LedgerTransferFailed'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+  notification.requested:
+    address: notification.requested
+    description: >
+      Команда оркестратора сервису уведомлений – известить получателя об исходе
+      перевода. Нагрузка – NotificationData, причём `recipient` = `from_account`
+      (id счёта-источника); сервис notification сам резолвит `owner_name` из
+      таблицы accounts.
+    messages:
+      NotificationRequested:
+        $ref: '#/components/messages/NotificationRequested'
+    bindings:
+      kafka:
+        partitions: 6
+        bindingVersion: 0.5.0
+
+operations:
+  sendPaymentInitiated:
+    action: send
+    channel:
+      $ref: '#/channels/payment.initiated'
+    title: gateway → payment.initiated
+    summary: gateway публикует событие старта саги.
+    messages:
+      - $ref: '#/channels/payment.initiated/messages/PaymentInitiated'
+
+  receivePaymentInitiated:
+    action: receive
+    channel:
+      $ref: '#/channels/payment.initiated'
+    title: orchestrator ← payment.initiated
+    summary: orchestrator создаёт состояние саги и запускает антифрод-проверку.
+
+  sendAntifraudCheckRequested:
+    action: send
+    channel:
+      $ref: '#/channels/antifraud.check.requested'
+    title: orchestrator → antifraud.check.requested
+    summary: orchestrator просит антифрод проверить перевод.
+    messages:
+      - $ref: '#/channels/antifraud.check.requested/messages/AntifraudCheckRequested'
+
+  receiveAntifraudCheckRequested:
+    action: receive
+    channel:
+      $ref: '#/channels/antifraud.check.requested'
+    title: antifraud ← antifraud.check.requested
+    summary: antifraud применяет правила и формирует решение.
+
+  sendAntifraudCheckCompleted:
+    action: send
+    channel:
+      $ref: '#/channels/antifraud.check.completed'
+    title: antifraud → antifraud.check.completed
+    summary: antifraud возвращает решение оркестратору.
+    messages:
+      - $ref: '#/channels/antifraud.check.completed/messages/AntifraudCheckCompleted'
+
+  receiveAntifraudCheckCompleted:
+    action: receive
+    channel:
+      $ref: '#/channels/antifraud.check.completed'
+    title: orchestrator ← antifraud.check.completed
+    summary: orchestrator при approved=true инициирует проводку в леджере, иначе – fail.
+
+  sendLedgerTransferRequested:
+    action: send
+    channel:
+      $ref: '#/channels/ledger.transfer.requested'
+    title: orchestrator → ledger.transfer.requested
+    summary: orchestrator просит леджер провести двойную запись.
+    messages:
+      - $ref: '#/channels/ledger.transfer.requested/messages/LedgerTransferRequested'
+
+  receiveLedgerTransferRequested:
+    action: receive
+    channel:
+      $ref: '#/channels/ledger.transfer.requested'
+    title: ledger ← ledger.transfer.requested
+    summary: ledger в одной транзакции пишет проводки и событие в outbox.
+
+  sendLedgerTransferCompleted:
+    action: send
+    channel:
+      $ref: '#/channels/ledger.transfer.completed'
+    title: ledger → ledger.transfer.completed
+    summary: ledger (через outbox-publisher) сообщает об успешной проводке.
+    messages:
+      - $ref: '#/channels/ledger.transfer.completed/messages/LedgerTransferCompleted'
+
+  receiveLedgerTransferCompleted:
+    action: receive
+    channel:
+      $ref: '#/channels/ledger.transfer.completed'
+    title: orchestrator ← ledger.transfer.completed
+    summary: orchestrator завершает сагу (payment.completed + notification.requested).
+
+  sendLedgerTransferFailed:
+    action: send
+    channel:
+      $ref: '#/channels/ledger.transfer.failed'
+    title: ledger → ledger.transfer.failed
+    summary: ledger сообщает об отказе проводки (например, недостаточно средств).
+    messages:
+      - $ref: '#/channels/ledger.transfer.failed/messages/LedgerTransferFailed'
+
+  receiveLedgerTransferFailed:
+    action: receive
+    channel:
+      $ref: '#/channels/ledger.transfer.failed'
+    title: orchestrator ← ledger.transfer.failed
+    summary: orchestrator откатывает сагу (payment.failed + notification.requested).
+
+  sendPaymentCompleted:
+    action: send
+    channel:
+      $ref: '#/channels/payment.completed'
+    title: orchestrator → payment.completed
+    summary: orchestrator публикует терминальное событие успеха.
+    messages:
+      - $ref: '#/channels/payment.completed/messages/PaymentCompleted'
+
+  receivePaymentCompleted:
+    action: receive
+    channel:
+      $ref: '#/channels/payment.completed'
+    title: внешние подписчики ← payment.completed
+    summary: аналитика / аудит / клиентские проекции потребляют терминальное событие.
+
+  sendPaymentFailed:
+    action: send
+    channel:
+      $ref: '#/channels/payment.failed'
+    title: orchestrator → payment.failed
+    summary: orchestrator публикует терминальное событие отказа.
+    messages:
+      - $ref: '#/channels/payment.failed/messages/PaymentFailed'
+
+  receivePaymentFailed:
+    action: receive
+    channel:
+      $ref: '#/channels/payment.failed'
+    title: внешние подписчики ← payment.failed
+    summary: аналитика / аудит / клиентские проекции потребляют терминальное событие.
+
+  sendNotificationRequested:
+    action: send
+    channel:
+      $ref: '#/channels/notification.requested'
+    title: orchestrator → notification.requested
+    summary: orchestrator просит уведомить получателя об исходе перевода.
+    messages:
+      - $ref: '#/channels/notification.requested/messages/NotificationRequested'
+
+  receiveNotificationRequested:
+    action: receive
+    channel:
+      $ref: '#/channels/notification.requested'
+    title: notification ← notification.requested
+    summary: notification доставляет уведомление и пишет журнал в Postgres.
+
+components:
+  messages:
+    PaymentInitiated:
+      name: PaymentInitiated
+      title: Платёж создан
+      summary: Старт саги P2P-перевода.
+      contentType: application/json
+      tags:
+        - name: saga
+        - name: money
+      payload:
+        $ref: '#/components/schemas/EnvelopeTransferData'
+
+    PaymentCompleted:
+      name: PaymentCompleted
+      title: Перевод завершён успешно
+      contentType: application/json
+      tags:
+        - name: saga
+      payload:
+        $ref: '#/components/schemas/EnvelopePaymentOutcome'
+
+    PaymentFailed:
+      name: PaymentFailed
+      title: Перевод отклонён
+      contentType: application/json
+      tags:
+        - name: saga
+      payload:
+        $ref: '#/components/schemas/EnvelopePaymentOutcome'
+
+    AntifraudCheckRequested:
+      name: AntifraudCheckRequested
+      title: Запрос антифрод-проверки
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/EnvelopeTransferData'
+
+    AntifraudCheckCompleted:
+      name: AntifraudCheckCompleted
+      title: Результат антифрод-проверки
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/EnvelopeAntifraudResult'
+
+    LedgerTransferRequested:
+      name: LedgerTransferRequested
+      title: Запрос проводки в леджере
+      contentType: application/json
+      tags:
+        - name: money
+      payload:
+        $ref: '#/components/schemas/EnvelopeTransferData'
+
+    LedgerTransferCompleted:
+      name: LedgerTransferCompleted
+      title: Проводка успешно проведена
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/EnvelopeLedgerResult'
+
+    LedgerTransferFailed:
+      name: LedgerTransferFailed
+      title: Проводка отклонена
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/EnvelopeLedgerResult'
+
+    NotificationRequested:
+      name: NotificationRequested
+      title: Запрос на уведомление
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/EnvelopeNotificationData'
+
+  schemas:
+    EventEnvelope:
+      type: object
+      description: >
+        Единый конверт события (shared/events.py::EventEnvelope). Поле `data`
+        переопределяется конкретной payload-схемой через allOf в наследниках.
+      required:
+        - event_id
+        - event_type
+        - occurred_at
+        - payment_id
+        - trace_id
+        - data
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор события (UUID v4).
+        event_type:
+          type: string
+          description: Имя топика/типа события, напр. "payment.initiated".
+          examples:
+            - payment.initiated
+        occurred_at:
+          type: string
+          format: date-time
+          description: Время возникновения события (ISO-8601, UTC).
+        payment_id:
+          type: string
+          description: Идентификатор платежа – сквозной ключ саги.
+        trace_id:
+          type: string
+          description: Сквозной идентификатор трассировки (по умолчанию = payment_id).
+        data:
+          type: object
+          description: Доменная полезная нагрузка (переопределяется в наследниках).
+
+    TransferData:
+      type: object
+      description: Параметры перевода (shared/events.py::TransferData).
+      required:
+        - payment_id
+        - from_account
+        - to_account
+        - amount
+        - idempotency_key
+      properties:
+        payment_id:
+          type: string
+        from_account:
+          type: string
+          description: Счёт-источник. Используется как ключ партиционирования Kafka.
+        to_account:
+          type: string
+          description: Счёт-получатель.
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Сумма в минорных единицах (копейки), строго > 0.
+          examples:
+            - 150000
+        currency:
+          type: string
+          default: RUB
+          examples:
+            - RUB
+        idempotency_key:
+          type: string
+          description: Ключ идемпотентности, проброшенный из заголовка Idempotency-Key.
+
+    AntifraudResult:
+      type: object
+      description: Решение антифрода (shared/events.py::AntifraudResult).
+      required:
+        - payment_id
+        - approved
+      properties:
+        payment_id:
+          type: string
+        approved:
+          type: boolean
+          description: true – перевод разрешён, false – отклонён.
+        reason:
+          type: string
+          nullable: true
+          description: Причина отказа (если approved=false).
+        score:
+          type: number
+          format: float
+          default: 0.0
+          description: Скоринг риска [0..1].
+
+    LedgerResult:
+      type: object
+      description: Результат проводки в леджере (shared/events.py::LedgerResult).
+      required:
+        - payment_id
+        - success
+      properties:
+        payment_id:
+          type: string
+        success:
+          type: boolean
+          description: true – проводки проведены, false – отказ (напр. недостаточно средств).
+        reason:
+          type: string
+          nullable: true
+          description: Причина отказа (если success=false), напр. "insufficient_funds".
+
+    NotificationData:
+      type: object
+      description: Данные уведомления (shared/events.py::NotificationData).
+      required:
+        - payment_id
+        - recipient
+        - status
+        - text
+      properties:
+        payment_id:
+          type: string
+        recipient:
+          type: string
+          description: Получатель уведомления (счёт/идентификатор клиента).
+        channel:
+          type: string
+          default: push
+          examples:
+            - push
+            - sms
+            - email
+        status:
+          type: string
+          enum:
+            - completed
+            - failed
+          description: Итоговый статус перевода для текста уведомления.
+        text:
+          type: string
+          description: Текст уведомления.
+
+    PaymentOutcomeData:
+      type: object
+      description: >
+        Компактная нагрузка терминальных событий payment.completed / payment.failed
+        (shared/events.py::PaymentOutcomeData – orchestrator публикует именно её):
+        {payment_id, status, reason?}.
+      required:
+        - payment_id
+        - status
+      properties:
+        payment_id:
+          type: string
+        status:
+          type: string
+          enum:
+            - completed
+            - failed
+          description: Итог перевода (в нижнем регистре, в отличие от статусов saga_state).
+        reason:
+          type: string
+          nullable: true
+          description: Причина отказа (только для payment.failed / status=failed).
+
+    EnvelopeTransferData:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/TransferData'
+
+    EnvelopeAntifraudResult:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/AntifraudResult'
+
+    EnvelopeLedgerResult:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/LedgerResult'
+
+    EnvelopeNotificationData:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/NotificationData'
+
+    EnvelopePaymentOutcome:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/PaymentOutcomeData'

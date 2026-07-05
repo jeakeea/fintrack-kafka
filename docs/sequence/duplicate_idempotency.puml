@@ -1,0 +1,46 @@
+@startuml duplicate_idempotency
+title FinTrack v2 – Повторный запрос с тем же Idempotency-Key
+
+actor Client as C
+participant "Gateway" as G
+queue "Kafka" as K
+participant "Orchestrator" as O
+participant "Antifraud" as A
+participant "Ledger" as L
+participant "Notification" as N
+database "Postgres" as DB
+
+autonumber
+
+== Первый запрос (ключ ещё не виден) ==
+C -> G : POST /transfers\nIdempotency-Key: K1
+activate G
+G -> DB : SELECT idempotency_keys WHERE key=K1 -> пусто
+G -> DB : INSERT idempotency_keys(K1 -> payment_id=P1)
+G -> K : publish payment.initiated (payment_id=P1)
+G --> C : 202 Accepted {payment_id=P1, status=accepted}
+deactivate G
+
+note over K,N: ... сага по P1 идёт обычным потоком (антифрод → леджер → уведомление) ...
+
+== Повторный запрос (ретрай клиента, тот же ключ) ==
+C -> G : POST /transfers\nIdempotency-Key: K1 (повтор)
+activate G
+G -> DB : SELECT idempotency_keys WHERE key=K1 -> найден P1
+note right of G
+  Ключ уже существует:
+  - НОВЫЙ payment не создаётся
+  - payment.initiated НЕ публикуется повторно
+  - возвращается тот же payment_id=P1
+end note
+G --> C : 202 Accepted {payment_id=P1, status=duplicate}
+deactivate G
+
+note over L
+  Вторая линия защиты – в леджере:
+  даже если дубликат события дойдёт до проводок,
+  UNIQUE(payment_id,account_id,direction)
+  не даст задвоить debit/credit (идемпотентный handler).
+end note
+
+@enduml

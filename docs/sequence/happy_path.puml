@@ -1,0 +1,67 @@
+@startuml happy_path
+title FinTrack v2 – Успешный перевод (happy path)
+
+actor Client as C
+participant "Gateway" as G
+queue "Kafka" as K
+participant "Orchestrator" as O
+participant "Antifraud" as A
+participant "Ledger" as L
+participant "Notification" as N
+database "Postgres" as DB
+
+autonumber
+
+C -> G : POST /transfers\nIdempotency-Key, {from,to,amount,currency}
+activate G
+G -> DB : INSERT idempotency_keys(key -> payment_id)\n(новый ключ)
+G -> K : publish payment.initiated\nkey=from_account, data=TransferData
+G --> C : 202 Accepted {payment_id, status=accepted}
+deactivate G
+
+K -> O : payment.initiated
+activate O
+O -> DB : saga_state = ANTIFRAUD_PENDING
+O -> K : publish antifraud.check.requested (TransferData)
+deactivate O
+
+K -> A : antifraud.check.requested
+activate A
+A -> A : проверка правил (велосити, лимиты)
+A -> K : publish antifraud.check.completed\nAntifraudResult{approved=true, score}
+deactivate A
+
+K -> O : antifraud.check.completed (approved=true)
+activate O
+O -> DB : saga_state = LEDGER_PENDING
+O -> K : publish ledger.transfer.requested (TransferData)
+deactivate O
+
+K -> L : ledger.transfer.requested
+activate L
+note right of L
+  Одна транзакция БД:
+  - debit  from_account (amount)
+  - credit to_account   (amount)
+  - INSERT outbox(ledger.transfer.completed)
+  UNIQUE(payment_id,account_id,direction)
+  гарантирует отсутствие задвоения
+end note
+L -> DB : BEGIN; INSERT debit; INSERT credit;\nINSERT outbox; COMMIT
+L -> K : publish (outbox relay) ledger.transfer.completed\nLedgerResult{success=true}
+deactivate L
+
+K -> O : ledger.transfer.completed (success=true)
+activate O
+O -> DB : saga_state = COMPLETED
+O -> K : publish payment.completed (PaymentOutcome)
+O -> K : publish notification.requested\nNotificationData{status=completed}
+deactivate O
+
+K -> N : notification.requested
+activate N
+N -> DB : INSERT notifications(status=completed)
+N -> C : доставка уведомления (push)
+deactivate N
+
+@enduml

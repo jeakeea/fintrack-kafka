@@ -1,0 +1,53 @@
+@startuml rollback_antifraud
+title FinTrack v2 – Откат: антифрод отклонил перевод
+
+actor Client as C
+participant "Gateway" as G
+queue "Kafka" as K
+participant "Orchestrator" as O
+participant "Antifraud" as A
+participant "Ledger" as L
+participant "Notification" as N
+database "Postgres" as DB
+
+autonumber
+
+C -> G : POST /transfers (Idempotency-Key, ...)
+activate G
+G -> DB : INSERT idempotency_keys
+G -> K : publish payment.initiated (TransferData)
+G --> C : 202 Accepted {payment_id, status=accepted}
+deactivate G
+
+K -> O : payment.initiated
+activate O
+O -> DB : saga_state = ANTIFRAUD_PENDING
+O -> K : publish antifraud.check.requested
+deactivate O
+
+K -> A : antifraud.check.requested
+activate A
+A -> A : правила сработали\n(превышен лимит / велосити / стоп-лист)
+A -> K : publish antifraud.check.completed\nAntifraudResult{approved=false, reason, score}
+deactivate A
+
+K -> O : antifraud.check.completed (approved=false)
+activate O
+note right of O
+  Леджер НЕ вызывается вообще.
+  Денежных проводок не было – компенсировать нечего.
+end note
+O -> DB : saga_state = FAILED, reason=antifraud_declined
+O -> K : publish payment.failed (PaymentOutcome{reason})
+O -> K : publish notification.requested\nNotificationData{status=failed}
+deactivate O
+
+K -> N : notification.requested
+activate N
+N -> DB : INSERT notifications(status=failed)
+N -> C : уведомление: перевод отклонён антифродом
+deactivate N
+
+L -[#gray]-> L : (ledger в этом сценарии не участвует)
+
+@enduml
